@@ -1,0 +1,890 @@
+---
+title: 'Stats For Cats: Classifying Adoption Outcome for Cats at the Austin Animal
+  Shelter'
+author: "Christian Dueñas"
+date: "5/17/2022"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+toc: yes
+---
+
+![](cat.png)
+
+# Motivation
+
+Overcrowding of animal shelters is a major problem across the nation. [According to ASPCA](https://www.aspca.org/helping-people-pets/shelter-intake-and-surrender/pet-statistics/) 6.5 million animals enter U.S shelters annually, about 3.2 million of the animals in shelters are cats. Approximately 920,000 shelter animals are euthanized, even though many of these animals are healthy enough to be adopted.
+
+In the hopes of assisting animal shelters towards finding shelter cats a happy home, we will delve into a data set of over 29000 shelter cats provided by the Austin Animal Center in Texas. The aim is to create a classifier that can predict if a cat will be adopted based on its characteristics. These classifiers may also offer insight into what characteristics play a significant role in adoption of a cat.
+
+The data set can be found at: https://www.kaggle.com/competitions/shelter-animal-outcomes/data
+
+# Cleaning the Data
+
+## Refactoring and Removing Redundant Features
+
+The `tidyverse` package contains multiple libraries to handle data wrangling. Most of the functions used will come from the `dplyr` library inside tidyverse.
+
+```{r, warning = F, message=F}
+# Data wrangling can be done using Tidyverse functions
+library(tidyverse)
+```
+
+
+We'll then load the original data set from Kaggle, which is in a csv file.
+
+```{r, warning = F}
+# read in the data from the local machine 
+cats_orig <- read.csv("cats.csv")
+# Look at all the available features in the data set
+names(cats_orig)
+```
+
+With the data loaded, we can begin the cleanup process. Many of the features are encoded as strings and may contain unnecessary characters. We want to re-encode them as `factors` so that they will be compatible with the model building functions. Some features may need to be modified on a case-by-case basis, but we can work towards having a "clean" version of the data set that will for the most part have all of the covariates in a model friendly form.
+
+```{r, warning = F, message =F}
+# Refactor variables of interest and store the result in a new variable
+# Make feature representation into something more meaningful
+cats <- cats_orig %>% rename(age.at.outcome = outcome_age_.years.) %>% 
+  mutate(sex = as.factor(sex), 
+         Spay.Neuter = ifelse(Spay.Neuter == "Yes", TRUE, FALSE),
+         is.kitten = ifelse(Cat.Kitten..outcome. == "Kitten", TRUE, FALSE), 
+         breed = as.factor(breed), 
+         color1 = str_remove(color1, "[ ]"),
+         outcome_weekday = as.factor(outcome_weekday),
+         outcome_month = as.factor(outcome_month),
+         coat_pattern = ifelse(coat_pattern == "", "solid", coat_pattern)
+         )
+```
+
+Some factors have a lot of unique levels. For example, if we look at the primary color of a cat, we can see that there are `r length(unique(cats$color1))` unique types for types for the primary color alone.
+
+```{r}
+table(cats$color1)
+```
+
+Trying to use all 28 will lead to problems as there are only a few cats under some of the levels. This will especially be a problem when we cross-validate the data, as not all types may show up in training data fit and the model will break during prediction.
+
+We will instead consider only taking some of the more popular colors, and pooling the low frequency or non-descriptive colors into an "other" category. We will do the same thing for the `coat_pattern` variable.
+
+```{r}
+# Refactor levels in features with only a few instances of a level
+cats$color1 <- ifelse(cats$color1 %in% c("black", "brown", "blue", "orange", "white") , cats$color1, "other") 
+cats$coat_pattern <- ifelse(cats$coat_pattern %in% c("agouti", "brindle", "smoke", "tricolor") , "other", cats$coat_pattern) 
+```
+
+Finally we can drop some of the unneeded or redundant features so that the data frame is smaller going forward. This can be done using the `select` function in `dplyr`.
+
+```{r}
+# Remove unnecessary and redundant features for classification
+cats_selected <- cats %>% select(-age_upon_outcome:-animal_type, 
+                        -date_of_birth:-name,-sex_upon_outcome,
+                        -count, -Periods:-outcome_age_.days., 
+                -Cat.Kitten..outcome.:-sex_age_outcome, -color, -breed1,-breed2)
+
+```
+
+
+## Defining "Adoption" and Working with Censored Data
+
+Looking at the data set, we can see that there are actually more than two outcomes a cat could have experienced. We can show all possible outcomes by using the `unique()` function on the outcome variable
+
+```{r}
+unique(cats$outcome_type) # See all possible outcomes
+```
+
+To make the classification problem simpler, we want to simplify the data into only two outcomes: Either the cat was adopted or it was not. In this case, what classifies as "adopted or not adopted" may be a bit subjective.
+
+Defining adopted cats is very simple as there is an "adoption" level. There may be some nuance such as animals that are adopted and then returned, but that data is not presented and would still technically mean that the cat was adopted. 
+
+```{r}
+# Gather the adopted cats
+cats_adopted <- cats_selected %>% filter(outcome_type == "Adoption") %>% 
+  mutate(adopted = TRUE)
+# Ensure that there are no cats with missing information
+nrow(cats_adopted) == sum(complete.cases(cats_adopted) )
+```
+
+
+"Not Adopted" is the more nuanced case. For example, cats labeled "return to owner" were not technically adopted as they were likely cats who already belonged to somebody and likely got lost. 
+
+"Transfer," "Euthanasia," "Died" and "Missing" present censored data, as whether the cat was going to be adopted or not is left unknown. An argument could be made that under certain conditions these categories could fall under the not adopted classification. For example, it may be fair to assume that a cat who died in the shelter or transferred after ten years was present long enough to be considered not adopted. This is very different from a cat who was only alive or in the  shelter for a few days before reaching an outcome. This is especially a problem with kittens who die in the shelter due to health problems from birth before they can really be put up for adoption.
+
+
+
+To handle the censored data, we will use a minimum age to consider if a cat had a reasonable time frame of being adopted. According to the cat website ["bechewy"](https://be.chewy.com/best-age-to-get-a-kitten/), cats at around 8 weeks are considered ready for adoption. We will say that around 16 weeks (or .3 years) will be out cutoff, as that gives kittens about 2 months to be potentially adopted before reaching any other outcome. This is not a perfect solution but is about as good as we can do given the constraints of the data.
+
+
+
+```{r}
+# Look at cats that weren't adopted and were adoptable for at least 2 months
+cats_notadopted <- cats_selected %>% 
+  filter(outcome_type %in% c("Transfer", "Euthanasia", "Died","Missing") &
+           age.at.outcome > .3) %>% mutate(adopted = FALSE)
+                
+sum(complete.cases(cats_notadopted)) == nrow(cats_notadopted)
+```
+
+With the `adoption` outcome recreated, we can combine our separated data into one "clean" data frame that can be used as the baseline going forward.
+
+```{r}
+# Baseline clean data set that will work with most models
+cats_clean <- rbind(cats_adopted, cats_notadopted)  -> cats_clean
+
+```
+
+
+
+# Exploratory Analysis
+
+Before we stick the data into a classifier, we can perform some visualization to get a feel for what the data looks like. These visualizations will be done using `ggplot2` and will consist mostly of frequency and proportion visualizations, as the features are mostly categorical.
+
+## Visualizing Cat Characteristics
+
+We'll begin by visualizing traits inherit to the cat. We want to see how each of the characteristics interact with adoption. We can do this using two-factor bar plots to assess the proportions of adopted vs non-adopted cats with certain qualities.
+
+
+
+
+Since we will be doing this for multiple factors, it will be useful to create a function that will make the process a bit easier by automating some of the repeated steps. The following helper functions will automate certain tasks going forward. We can then build ontop our plots using the `ggplot` capabilities to add unique attributes such as titles.
+
+```{r, warning = F, message = F}
+# Load in ggplot2 as well as rlang to create the functions
+library(ggplot2)
+library(scales)
+library(rlang)
+options(dplyr.summarise.inform = FALSE)
+
+# Function that finds the proportions grouped by two factors
+# Assumes first factor is only two levels (Binary yes or no)
+get_props_counts <- function(df, factor1, factor2) {
+  # Get the total count per outcome of the first factor
+  outcomes <- unique(df[[factor1]])
+  df_yes <- df %>% filter(!!sym(factor1) == outcomes[1] )
+  df_no <- df %>% filter(!!sym(factor1) == outcomes[2] )
+  
+  df_yes %>% group_by(!!sym(factor1),!!sym(factor2)) %>%
+          summarize(count = n(), prop = n()/ nrow(df_yes) ) -> yes_prop
+  
+  df_no %>% group_by(!!sym(factor1),!!sym(factor2)) %>%
+        summarize(count = n(), prop = n()/ nrow(df_no) ) -> no_prop
+  
+  return( rbind(yes_prop,no_prop))
+}
+
+
+# Function that formats a floating point number into a readable precent
+# Used to overlay proportions on top of the bar plots
+format_prop <- function(prop) {
+  paste0(as.character(round(prop, digits = 3) * 100), '%')
+}
+
+
+# Wrapper for ggplot that will take in data and make a dodged bar plot
+# Elements that will be present for all bar plots in this project are 
+# included here
+create_dodge_bars <- function(df, x, fill_var) {
+  g1 <- ggplot(data=df, mapping = aes(x = !!sym(x), y = prop)) +
+    geom_bar(aes(fill = !!sym(fill_var)), 
+             stat = "identity", position = "dodge") +
+    geom_text(aes(label = format_prop(prop)), size=2.9,
+              position = position_dodge2(width = .9), vjust=-.6) + 
+    scale_y_continuous(labels = scales::percent, limits=c(0,1)) + 
+    xlab("Was the Cat Adopted?") +ylab("Percentage") + theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5)) + 
+    labs(subtitle = paste("Total Count:", sum(df$count)))
+  return(g1)
+}
+```
+
+
+We'll also format that data in a ggplot friendly way. This will make generating the axis labels very simple going forward. We will create a new data frame as our `cats_clean` will still be used for model building.
+
+```{r, message = F}
+# Create a new data frame
+cats_desc <- cats_clean
+
+# make boolean variables into factors
+# order the levels if necessary
+cats_desc$adopted <- ifelse(cats_clean$adopted == 1, "Yes", "No")
+cats_desc$is.kitten <- ifelse(cats_clean$is.kitten == 1, "Yes", "No")
+cats_desc$Spay.Neuter <- ifelse(cats_clean$Spay.Neuter == 1, "Yes", "No")
+cats_desc$age_group <- ifelse(
+  cats_desc$age_group == "(-0.022, 2.2]", "(0, 2.2]", cats_desc$age_group)
+cats_desc$age_group <- factor(cats_desc$age_group, levels = 
+                            c("(0, 2.2]","(2.2, 4.4]","(4.4, 6.6]",
+                              "(6.6, 8.8]","(8.8, 11.0]", "(11.0, 13.2]",
+                              "(13.2, 15.4]","(15.4, 17.6]","(17.6, 19.8]", 
+                              "(19.8, 22.0]"), ordered = T)
+```
+
+
+Using our newly created `get_props_counts` function, we can group our data by the factor of interest and whether it was adopted or not. We can then get the proportions and counts that can be used for the plots.
+
+```{r, message = F, warning = F}
+# Gather proportions/counts for the characteristics of interest
+props_by_sex <- get_props_counts(cats_desc, "adopted", "sex")
+props_by_kitten <- get_props_counts(cats_desc, "adopted", "is.kitten")
+props_by_fix <- get_props_counts(cats_desc, "adopted", "Spay.Neuter")
+props_by_color <- get_props_counts(cats_desc, "adopted", "color1")
+props_by_age_group <- get_props_counts(cats_desc, "adopted", "age_group")
+props_by_coat <- get_props_counts(cats_desc, "adopted", "coat_pattern")
+
+```
+
+### Sex
+
+The first characteristic that will be visualized is the effect of sex on adopted cats. We can generate the bar plot using our wrapper function and add some unique properties for more descriptive looks.
+
+We can print the frequencies and bar plot below
+
+```{r, warning =F, message = F}
+library(patchwork) # library that allows us to add to stored plots
+
+# print frequencies 
+props_by_sex
+# Plot the proportions of Adopted Cats by Sex
+create_dodge_bars(props_by_sex, "adopted", "sex") + 
+  labs(fill="Sex") +ggtitle("Percentage of Adopted Cats by Sex") +
+  scale_fill_manual(values=c("#f8b9d4", "#89CFF0"))
+```
+
+Looking at the plots, we see that the proportions between males and females are relatively close when considering adopted cats; however female cats make up a bit larger proportion of the non-adopted cats compared to males. This small distinguishment may or may not be useful during the classification process.
+
+
+### Spaying/Neutering 
+
+One of the features included in the data was whether or not the cat was fixed before its outcome. 
+
+```{r, warning =F}
+props_by_fix
+
+create_dodge_bars(props_by_fix, "adopted", "Spay.Neuter") + 
+  labs(fill="Fixed") +ggtitle("Percentage of Adopted Cats by Fixing") +
+  scale_fill_manual(values=c("red", "#34b233"))
+```
+
+Looking at the plots, we see that nearly all of the adopted cats were fixed. Although it may be seen as potential significant feature, we should be careful as such drastic proportions may represent something happening behind the scenes. 
+
+Looking at the Austin Animal Shelter, it is stated that animals are required to be fixed before adoption. This raises a few questions. For example, why were some of the adopted cats not fixed? And is this variable going to cause an overfit? This is especially a concern if the model is used on cats at a different shelter with different guidelines. 
+
+
+### Cat or Kitten
+
+According to the data set, a cat under one year old is defined as kitten. Is this distinguishment notable enough to include in our model?
+
+```{r, warning=F}
+# print frequencies
+props_by_kitten
+# Plot the proportions of Adopted Cats by whether it is a kitten or not
+create_dodge_bars(props_by_kitten, "adopted", "is.kitten") +
+  labs(fill="Kitten") +ggtitle("Percentage of Adopted Cats vs Kittens")
+```
+
+
+
+Looking at the proportions, we see that kittens make up a small fraction of the cats who were not adopted. This plot seems to suggest that the cat being classified as a kitten will be a good predictor that the cat will be adopted.
+
+### Color
+
+Next we'll be looking at the primary color of the cat. There are 6 levels that we will consider
+
+```{r, message=FALSE, warning = F}
+# Print frequencies
+props_by_color
+
+# Create bar charts based on the color
+create_dodge_bars(props_by_color, "adopted", "color1") +
+  scale_fill_manual(values=c("black", "blue", "brown",
+                             "orange", "purple", "gray")) +
+  scale_y_continuous(labels = scales::percent, limits=c(0,.3)) +
+  labs(fill="Color") + ggtitle("Percentage of Adopted Cats by Primary Color") +
+  theme(legend.position = "bottom")
+
+```
+
+The frequencies for adopted cats looks very similar to the frequencies of non-adopted cats. The plot suggests that classifying whether a cat was adopted using its color may prove a bit difficult.
+
+### Coat Pattern
+
+Coat pattern is another visual characteristic we can look at.
+
+```{r, warning = F, message = F}
+props_by_coat
+
+create_dodge_bars(props_by_coat, "adopted", "coat_pattern") +
+  scale_y_continuous(labels = scales::percent, limits=c(0,.5)) +
+  labs(fill="Coat")+
+  theme(legend.position = "bottom") + 
+  ggtitle("Percentage of Adopted Cats by Coat Pattern")
+```
+
+Coat pattern exhibits similar trends that the color variable did. Looking forward, it will be interesting to see if visual characteristics of a cat provide any valuable insight as to whether the cat will be adopted or not.
+
+### Age
+
+Next we will look at the age of the cat. First, we can generate a histogram of the overall dataset to get a feel for the distribtion of cat ages across the dataset.
+
+```{r}
+# Create a histogram for the cat ages
+# Use a pre-build to get the number of bins for a color gradient
+age_hist <- ggplot_build(
+    ggplot(data = cats_desc, mapping = aes(x = age.at.outcome)) +
+    geom_histogram(aes(y=..density.., ),binwidth=1) + 
+    theme_bw() )
+# Get the number of bins
+num_bins <- dim(age_hist$data[[1]])[1]
+
+# Print summary statistics of cat ages
+summary(cats_desc$age.at.outcome)
+
+# generate the plot with the color gradient 
+ggplot(data = cats_desc, mapping = aes(x = age.at.outcome)) +
+    geom_histogram(aes(y=..density.., ),binwidth=1, color="black",
+        fill=colorRampPalette(c("#EADDCA", "gray"), bias=2)(num_bins)) + 
+    theme_bw() + xlab("Age (in years)") + ylab("Density") + 
+    ggtitle("Histogram of Cat Ages") +
+    theme(plot.title = element_text(hjust = 0.5)) 
+
+```
+
+Looking at the histogram, we can see that a majority of the cats are less than a year old, with the median value being around half a year old. There are also some cats who lived to be incredibly old, with the max being at 22. We also see 0 as the minimum age. This seems to imply that a kitten found a home immediately after it was born, perhaps as a package deal with its previously-pregnant mother as kittens typically need to be with their mothers during the first 8 weeks.
+
+We can create more histograms, this time looking at the distribution of adopted cats and non adopted cats
+
+
+```{r}
+# Subset to cats who got adopted
+cats_desc %>% filter(adopted =="Yes") -> cats_desc_adopt
+
+# Print summary stats for the age of adopted cats
+summary(cats_desc_adopt$age.at.outcome)
+
+ggplot(data = cats_desc_adopt, mapping = aes(x = age.at.outcome)) +
+    geom_histogram(aes(y=..density.., ),binwidth=1, color="black",
+        fill="#00FFFF") + 
+    theme_bw() + xlab("Age (in years)") + ylab("Density") + 
+    ggtitle("Histogram of Adopted Cat Ages") +
+    theme(plot.title = element_text(hjust = 0.5)) 
+```
+
+Looking at the distribution, we see a heavy right skew. This implies that a majority of the cats being adopted are generally younger in age. Looking at the summary output, the median adopted cat was 0.2466 years, which is around 3 months.
+
+We can do the same for the non-adopted cats
+
+```{r}
+# Look at the distribution of cats who were not adopted
+cats_desc %>% filter(adopted =="No") -> cats_desc_nadopt
+
+# Print summary stats for the age of non-adopted cats
+summary(cats_desc_nadopt$age.at.outcome)
+
+# generate the plot with the color gradient 
+ggplot(data = cats_desc_nadopt, mapping = aes(x = age.at.outcome)) +
+    geom_histogram(aes(y=..density.., ),binwidth=1, color="black",
+        fill=colorRampPalette(c("#f47174", "gray"), bias=2)(23)) + 
+    theme_bw() + xlab("Age (in years)") + ylab("Density") + 
+    ggtitle("Histogram of Non-Adopted Cat Ages") +
+    theme(plot.title = element_text(hjust = 0.5)) 
+```
+
+The distribution here is shifted more towards the right, implying the non-adopted cats tended to be older. The median age of a non-adopted cat was about a year old, which is the cutoff for defining it as a kitten.
+
+
+
+### Wordcloud of Cat Names for Adopted Cats
+
+Cat names will not be usable in the classifiers due to how unique they are, but as a fun exercise, we can generate a word cloud containing the most frequent names among adopted cats. This can be done using the `wordcloud` package. We will also transform the names to lowercase and remove any astrichs in the names to normalize the strings for counting. 
+
+```{r, warning = F, message = F}
+library(wordcloud)
+library(stringr)
+
+# Remove cats without names and consider only cats who were adopted
+cat_names <- cats_orig %>% filter(name != "" & outcome_type== "Adoption") %>%
+  pull(name)
+# Lower all names to lowercase and remove astrichs to normalize the text
+cat_names <- tolower( str_replace(cat_names, "[*]", "") )
+
+
+wordcloud(cat_names, min.freq = 20, max.words = 40, scale=c(3.5,0.25))
+```
+
+Charlie, Luna, Bella and Kitty seem to a few of the most popular names among the cats who were adopted. 
+
+
+
+## External Time Factors
+
+Do more cats get adopted on a particular day? Or month of the year? We can use the data set to see the time periods that effect cat adoption. We will restrict our data to only adopted cats in this case, as it is more meaningful in terms of interpretation.
+
+### Day of the Week
+
+Knowing which day of the week most cats are adopted on can help shelters when organizing events and adoption fairs. We can create a bar chart to see the proportions of which weekday the cats were adopted on.
+
+```{r}
+cats_desc %>% filter(adopted == "Yes") %>% group_by(outcome_weekday) %>% 
+  summarise(count = n(), prop= n() / nrow(cats_desc)) -> cats_by_day
+
+cats_by_day$outcome_weekday <- factor(cats_by_day$outcome_weekday, levels = 
+  c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"))
+
+
+ggplot(data=cats_by_day, mapping=aes(x = outcome_weekday, y = prop)) +
+  geom_bar(aes(fill = outcome_weekday), stat= "identity") +
+  geom_text(aes(label = format_prop(prop)),
+              position = position_dodge2(width = .9), vjust=-.6) + theme_bw() +
+  scale_y_continuous(labels = scales::percent, limits=c(0,.2)) +
+  theme(legend.position = "None", plot.title = element_text(hjust = 0.5)) + 
+  xlab("") + ylab("Percent Adopted") + 
+  ggtitle("Percent of Cats Adopted by Weekday") 
+
+```
+
+Looking at the plot, the `proportions seem roughly similar until the weekend, where we see an increase. We can formally test if this increase is significant using a $\chi^2$ Goodness-Of-Fit test. We will test the following hypothesis
+
+$H_0:$ The proportion of adopted cats is the same across all weekdays
+
+$H_A:$ At least one weekday has a different adoption rate
+
+```{r}
+# Perform a goodness of fit test
+chisq.test(cats_by_day$count)
+```
+
+The p-value is near 0, so we reject the null hypothesis. There is significant evidence to suggest that the day of the week are not equal in their adoption rates. It seems that weekends have higher adoption rates.
+
+
+
+### Month of the Year
+
+Does the month of the year effect the adoption rate? Perhaps we can see trends around holidays, or seasonality. We can plot the proportions and look for trends.
+
+
+```{r}
+# Get the proportion of cats adopted by month
+cats_desc %>% filter(adopted == "Yes") %>% group_by(outcome_month) %>% 
+  summarise(count = n(), prop= n() / nrow(cats_desc)) -> cats_by_month
+
+# Change the numeric months to their abbreviations
+cats_by_month$outcome_month <- factor(month.abb[cats_by_month$outcome_month],
+                                      levels = month.abb)
+
+# Create a bar chart for the month
+ggplot(data=cats_by_month, mapping=aes(x = outcome_month, y = prop)) +
+  geom_bar(aes(fill = outcome_month), stat= "identity") +
+  geom_text(aes(label = format_prop(prop)),
+              position = position_dodge2(width = .9), vjust=-.6) + theme_bw() +
+  scale_y_continuous(labels = scales::percent, limits=c(0,.15)) +
+  theme(legend.position = "None", plot.title = element_text(hjust = 0.5)) + 
+  xlab("") + ylab("Percent Adopted") + 
+  ggtitle("Percent of Cats Adopted by Month")  + 
+  scale_fill_manual(values=RColorBrewer::brewer.pal(12,"Set3")[12:1])
+```
+
+Looking at the plot, we see some interesting results. July seems to be the month with the most cat adoptions. Excluding the jump in July, June through December have a roughly consistent adoption rate. What is interesting is that we do see a drop off starting in January and continuing throughout the Winter and Spring until the start of Summer.
+
+We can formally test this as well
+
+$H_0:$ The proportion of adopted cats is the same across all 12 months
+
+$H_A:$ At least one month has a different adoption rate
+
+```{r}
+# Perform a goodness of fit test
+chisq.test(cats_by_month$count)
+```
+
+The p-value is near 0, so we reject the null hypothesis. There is significant evidence to suggest that the months are not equal in their adoption rates. 
+
+# Creating Classifiers
+
+Now that we've explored the different features of the data, we can begin creating our classifiers.
+
+## Features for Consideration
+
+We'll use the following variables in our classification models
+
++ Sex of the cat
+
++ Age of the cat in years
+
++ Whether the cat was fixed or not
+
++ If the cat is a CFA breed (Cat Fanciers Association -  A registry of pedigreed cats)
+
++ If the cat is a domestic breed
+
++ The hour the outcome occurred
+
++ The day of the week the outcome occurred
+
++ The month the outcome occurred
+
++ The primary color of the cat
+
++ The coat pattern of the cat
+
++ Whether or not the cat is considered a kitten
+
+We can generate a string of our model in an R friendly format and continually pass it through our models.
+
+```{r}
+# Create the model formula we will be using for the classifiers
+cat.formula <- paste0("adopted  ~ sex + Spay.Neuter + age.at.outcome",
+" + cfa_breed + domestic_breed + outcome_weekday + outcome_month", 
+" + color1 + coat_pattern + outcome_hour + is.kitten")
+```
+
+## Using Cross-Validation To Prevent Overfitting
+
+To avoid potential data leakage, we will use a 5-fold cross validation procedure on each of our classifiers. We will compute metrics using each partition as the test data and pool together the predictive accuracy. This will help us assess the predictive power of the model outside the data set. 
+
+As a fun coding challenge, we will also create a cross validation function from scratch and use it on some of our classifiers as opposed to the black box implementations from other packages.  
+
+The following is the custom Cross Validation function along with some helper functions. These were kept separate for modularization purposes. It is designed to work with most models in R, although some implementations may require more care.
+
+
+```{r}
+# Helper Function that assigns fold ids to a dataframe
+assign_fold_id <- function(k, n) {
+  foldid <- sample(rep(1:k, length = n))
+  return(foldid)
+}
+
+# Helper Function that computes accuracy given a confusion matrix
+compute_accuracy <- function(conf_matr) {
+  errors <- conf_matr[2,1] + conf_matr[1,2]
+  tot <- conf_matr[2,1] + conf_matr[1,2] + conf_matr[1,1] + conf_matr[2,2]
+  return( 1- errors/tot)
+}
+
+# Helper function that computes the optimal cutoff value using the ROC curve
+compute_cutoff <- function(data, formula, labels) {
+    all_fit <- glm(formula = formula, data=data,
+                     family = "binomial")
+      # Use the training data to get the optimal cutoff for accuracy
+    pred <- predict(all_fit, type="response")
+    pred <- prediction(pred, data[[labels]])
+    
+    perf <- ROCR::performance(prediction.obj =pred, measure = "acc")
+    # Get the optimal cutoff value
+    max_ind <- which.max(slot(perf, "y.values")[[1]] )
+    cutoff <- slot(perf, "x.values")[[1]][max_ind]
+    return(cutoff)
+}
+
+# Helper function that fits a logistic regression model
+fit_logistic_model <- function(data, formula) {
+  glm(formula = formula, data=data,
+                     family = "binomial")
+}
+
+# gets predictions from different classifiers
+get_predictions <- function(fit,test=NULL, LogReg =FALSE, cutoff = 0) {
+  # Classify for Logistic Regression using cutoff
+  if(LogReg) {
+    return(LogReg_predicitons(fit,test, cutoff ))
+  }
+  # Handle most other classifiers using predict
+  else {
+    # If test data is provided, use it
+    if (!is.null(test)) {
+      return(predict(fit,test, type="class"))
+    }
+    return(predict(fit, type="class"))
+  }
+}
+
+# Special case that handles logistic regression prediction with ROC curve
+LogReg_predicitons <- function(fit,test, cutoff ) {
+  # If test data is supplied, test that
+  if(!is.null(test)) {
+    test_pred <- ifelse(predict.glm(fit, test, type="response") > cutoff, 1, 0)
+    return(test_pred)
+  }
+  # Otherwise, just check the training data
+  train_pred <- predict(fit, type="response")
+  train_pred <- ifelse(train_pred > cutoff, 1, 0)
+  return(train_pred)
+  
+}
+
+# Function that performs k-fold Cross Validation for a logistic regression fit
+Cross_Validate <- function(data, formula, K, labels, fit_model, LogReg=F) {
+  # shuffle the data
+  data <- data[sample(1:nrow(data)),]
+  # Assign fold IDs to the data
+  folds <- assign_fold_id(K, nrow(data))
+  formula <- as.formula(formula)
+  
+  # Create vectors to store proportions for each iteration
+  train_accuracy_vec <- double(K)
+  test_accuracy_vec <- double(K)
+  FPR_vec <- double(K)
+  FNR_vec <- double(K)
+  
+  # Get the cutoff from the ROC curve using all the data if doing a LogReg fit
+  cutoff <- 0
+  if (LogReg) {
+    cutoff <- compute_cutoff(data = data, formula = formula,labels=labels)
+  }
+  
+  # Fit the model and test for each partition
+  for (i in 1:K) {
+    # Subset the data into training and testing
+    train_data <- subset(data, folds != i)
+    test_data <- subset(data, folds == i)
+    
+    # Fit the model using the training data
+    train_fit <- fit_model(data=train_data, formula=formula)
+    
+    # Check the accuracy of the training data
+    train_pred <- get_predictions(train_fit, LogReg = LogReg,cutoff=cutoff)
+    # Create the Confusion Matrix with these predictions 
+    confusion.matrix.train <- table(train_pred,train_data[[labels]])
+    train_accuracy_vec[i] <- compute_accuracy(confusion.matrix.train)
+   
+    # Predict the test data points using this cutoff
+    test_pred <- get_predictions(fit=train_fit, test=test_data,
+                                 LogReg = LogReg,cutoff =cutoff )
+    
+    # Create the Confusion Matrix with these predictions 
+    confusion.matrix <- table(test_pred,test_data[[labels]])
+    #store test accuracy, FPR and FNR for the iteration
+    test_accuracy_vec[i] <- compute_accuracy(confusion.matrix)
+    FPR_vec<-confusion.matrix[1,2]/(confusion.matrix[1,1]+confusion.matrix[1,2])
+    FNR_vec<-confusion.matrix[2,1]/(confusion.matrix[2,1]+confusion.matrix[2,2])
+
+  }
+  # Average accuracy, FPR, and FNR over all folds
+  print(paste0(K,"-Fold Cross Validation Metrics" ))
+  print(paste("Pooled Training Data Accuracy:",mean(train_accuracy_vec)))
+  print(paste("Pooled Test Data Accuracy:", mean(test_accuracy_vec)))
+  print(paste("Pooled False Positve Rate:", mean(FPR_vec)))
+  print(paste("Pooled False Negative Rate:", mean(FNR_vec)))
+  
+}
+
+
+
+
+
+```
+
+## Logistic Regression
+
+The first classifier will be a logistic regression model. Before testing the model, we need to consider what threshold we want to use for classifying using the estimated proportions. We can use functions from the `ROCR` package to tune an optimal cutoff. False Positive or False Negative rates may be under individual consideration in some contexts, but here we will tune for overall accuracy. We will get this cutoff from all of the training data and use it as the cutoff in the Cross Validation models.
+
+
+```{r, eval = T, warning=F}
+library(ROCR)
+# Fit all of the data into a model to see the training data ROC curve
+log_fit <- glm(formula = cat.formula, data= cats_clean, family = "binomial")
+pred <- predict(log_fit, type="response")
+pred <- prediction(pred, cats_clean$adopted)
+
+# Look at the training fit to see the variable effects
+summary(log_fit)
+
+# Plot the ROC curve for the training data
+roc <- performance(pred, "tpr", "fpr")
+plot(roc, colorize=T, lwd=2, main = "ROC curve for Logistic Regression Fit")
+abline(a=0,b=1)
+
+# Get the optimal cutoff value and see what the accuracy is for the training set
+perf <- ROCR::performance(prediction.obj =pred, measure = "acc")
+max_ind <- which.max(slot(perf, "y.values")[[1]] )
+(acc <- slot(perf, "y.values")[[1]][max_ind])
+(cutoff <- slot(perf, "x.values")[[1]][max_ind])
+```
+According to the Logistic Regression model, some of the significant predictors include if the cat was fixed, if the outcome occurred on a weekend, the month of the outcome (for certain months), the coat pattern, the hour the outcome occurred, and whether or not the cat was a kitten.
+
+We can perform the Cross Validation Procedure to see how well the model predicts new data
+
+```{r, eval=T}
+# Perform CV to see how well the model predicts new data
+Cross_Validate(data = cats_clean, formula = cat.formula, K=5, labels = "adopted",
+            fit_model = fit_logistic_model, LogReg = T)
+```
+The accuracy rate is between 84% and 85% accuracy for the training and test set. We see that the False Positive Rate is higher than the False Negative rate.
+
+
+## Support Vector Machine
+
+Next we will consider a support vector classifier. We will use a linear kernel. This model requires a "cost" parameter that needs to be tuned. This can be done using Cross Validation.
+
+```{r,eval = T}
+library(e1071)
+# Reformat the data to work well with SVM
+cats_clean_svm <- cats_clean
+
+# Redefine the adoption outcome so that it is 1 or -1
+cats_clean_svm$adopted <- as.factor(cats_clean_svm$adopted)
+
+# Tune for the best cost value using Cross Validation
+tuned_svm <- tune(svm, train.x=as.formula(cat.formula), data = cats_clean_svm,kernel="linear",
+                  scale=F,ranges=list(cost=seq(.1,.10,.1)),
+                  tunecontrol=tune.control(sampling="cross",cross=2))
+
+
+# Save the best tuned cost
+best_cost_svm <- tuned_svm$best.parameters$cost
+# Compute a confusion matrix for the training data 
+CMatrix <- table(predict(tuned_svm$best.model), cats_clean_svm$adopted)
+colnames(CMatrix) <- c("Not Adopted", "Adopted")
+rownames(CMatrix) <- c("Not Adopted", "Adopted")
+CMatrix # print the confusion Matrix for the Training Data
+```
+With the optimal tune parameter, we can perform cross validation on our model to see its predictive capabilities.
+
+
+```{r, eval = T}
+fit_SVM <- function(data, formula) {
+  return(
+    svm(formula = as.formula(formula), data = data, kernel="linear",
+        cost = best_cost_svm)
+  )
+}
+
+Cross_Validate(data = cats_clean_svm, formula = cat.formula, K=5, labels = "adopted",
+            fit_model = fit_SVM, LogReg = F)
+
+
+```
+
+Looking at the predictive accuracy, we are still getting around 84% for the training and testing sets.
+
+
+## Decision Tree
+
+Using the `rpart` library, we can create a decision tree classifier. We can draw a tree using all the training data and visualize it to get a sense of what variables result in the most information gain.
+
+```{r, eval = T, warning =F, message=F}
+library(rpart)
+library(rpart.plot)
+library(rattle)
+
+fit_tree <- function(data, formula) {
+  return(
+    rpart(formula = as.formula(formula), data=data, 
+                  method = "class")
+  )
+}
+
+fancyRpartPlot( fit_tree(cats_clean, cat.formula), 
+                main = "Decision Cat Tree", sub=""  )
+```
+Looking at the decision tree, we can see that age, fixing and time (hour, day, month) are considered the most influential observations. It also suggests that young kittens are especially likely to get adopted, which is not too suprising of a result.
+
+We can then use cross validation to assess the predictive power of the decision tree for classifying adoption. Note that the trees compute local solutions, so not all trees might be the same when fit with different training sets. 
+
+```{r, eval = T}
+Cross_Validate(data = cats_clean,formula = cat.formula, K=5, labels = "adopted",
+            fit_model = fit_tree, LogReg = F)
+```
+
+The decision tree has a predictive power of around 86% accuracy, which so far is the best performance.
+
+## K-Nearest Neighbors
+
+The last classifier we will consider is the K-Nearest Neighbors. This classifier requires a bit more caution as it will not be able to work well with some of the categorical variables. This is because KNN computes euclidean distance, which is not possible on a feature like color. For some features such as the day of the week, we can re-factor them as ordinal variables and use their numerical values inside the distance.
+
+
+
+```{r, warning=F}
+# Remove non ordinal variables
+cats_clean %>% select(-outcome_subtype,-outcome_type,-age_group:-dob_monthyear,
+                      -color2,-coat, -breed, -outcome_year, -coat_pattern, -color1) %>%
+  mutate(sex = ifelse(sex=="Male", 1,0), 
+         outcome_month= as.numeric(outcome_month),
+         adopted = as.factor(adopted), 
+         outcome_weekday = as.integer(outcome_weekday)) -> cats_knn
+
+```
+
+Which K should we use for KNN? We can tune for this using the K that has the best predictive accuracy. The `caret` function has a handy framework that will allow us to do this.
+
+
+```{r, warning = F, message=F, eval=T}
+library(caret)
+# Set how we will train the model
+trControl <- caret::trainControl(method  = "cv",
+                          number  = 5)
+# Fit the KNN classifier and tune for the best k
+fit <- caret::train(adopted ~ .,
+             method     = "knn",
+             tuneGrid   = expand.grid(k = 1:20),
+             trControl  = trControl,
+             metric     = "Accuracy",
+             data       = cats_knn)
+# See which model performed the best
+fit
+```
+Based on predictive accuracy, k = `r fit$bestTune$k` was considered the best. This returned a predictive accuracy of `r max(fit$results$Accuracy)`.
+
+# Key Takeaways
+
+The classifiers were able to predict correctly around 83%-86% of the time. Some of the most important features mentioned throughout were
+
++ The Age of the Cat
+
++ Time, Month and Day of the outcome
+
++ Whether or not the cat was considered a kitten
+
++ Whether or not the cat was fixed
+
+Some of these variables were not terribly suprising. It is no secret that kittens generally have an easier time being adopted compared to older cats as they can get accustomed to living with humans better. Fixing cats may or may not be required at shelters, which may be biasing the predictive results a bit. Nonetheless, fixing a cat can be a bit pricey, so it is not unreasonable to say that adopting a fixed cat is a huge plus monetarily.
+
+Physical characteristics such as sex and color didn't seem to have a huge impact in the classification process. This was also hinted at in the exploratory analysis. Perhaps the aesthetics of a cat is something that people may not care much about when deciding to adopt one.
+
+The date effect was an intersting find. It seems as though adoptions were especially likely during the weekends. This could be due to outside influences such as adoption events being more prevalent during these times. A follow up analysis could be to track if any large scale adoption events occurred on weekends. If not, the shelters should definitely emphasize any events on weekends as people are generally more free anyways.
+
+Cat adoptions seemed to be popular during the Summer and Fall, and then fall off in post-Christmas into Spring. Perhaps shelters could incorporate some sort of marketing campaign to make up for these downturns.
+
+One suggestion I would make to the shelter would be to consider including the length of time that the animal was in the shelter. This was somewhat included, but not very precisely and left to some interpretation. If this was included, a survival analysis could be done on the time until outcome for the cats. This would provide valuable insight while also being able to account for the censoring data.
+
+
+
+
+```{r}
+cats_clean %>% group_by(is.kitten, outcome_month) %>% summarise(count = n() ) %>% mutate(freq = count/ sum(count))
+```
+
+
+```{r}
+library(nnet)
+
+minval <- 1e5
+for (k in 1:50) {
+  init <- runif(75,-0.7,0.7)
+
+  fitnn <- nnet::nnet(formula =as.formula(cat.formula), data=cats_clean, size=2,
+             softmax=F, decay=.2,entropy=T,maxit=5000,trace=F, wts=init)
+  
+  if (fitnn$value<minval) {
+    minval <- fitnn$value
+    minwts <- init
+    fitnn.save<-fitnn
+    }
+
+}
+
+
+fit_nn <- function(data, formula, minwts = minwts ){
+  return(
+    nnet::nnet(formula =as.formula(cat.formula), data=data, size=2,
+             softmax=F, decay=.2,entropy=T,maxit=5000,trace=F, wts=minwts)
+  )
+  
+}
+
+Cross_Validate(data = cats_clean,formula = cat.formula, K=5,labels = "adopted",
+            fit_model = fit_nn, LogReg = F)
+
+```
+
+
