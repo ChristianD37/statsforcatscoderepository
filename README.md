@@ -4,9 +4,9 @@
 
 A graduate level project created for STAT 208, Spring 2022
 
-Full Report can be found in the statsforcats.pdf file. Code chunks are included in the Rmd file.
+The full report can be found in the statsforcats.pdf file. Code chunks are included in the Rmd file.
 
-The original;  data set can be found at: https://www.kaggle.com/competitions/shelter-animal-outcomes/data
+The original data set can be found at: https://www.kaggle.com/competitions/shelter-animal-outcomes/data
 
 ## Motivation
 
