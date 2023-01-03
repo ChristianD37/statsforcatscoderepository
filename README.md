@@ -1,4 +1,4 @@
-#Stats for Cats 
+# Stats for Cats 
 
 ## A Machine Learning and Data Mining Project by Christian Dueñas
 
