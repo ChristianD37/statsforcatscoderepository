@@ -10,7 +10,7 @@ The original;  data set can be found at: https://www.kaggle.com/competitions/she
 
 ## Motivation
 
-Overcrowding of animal shelters is a major problem across the nation. [According to ASPCA](https://www.aspca.org/helping-people-pets/shelter-intake-and-surrender/pet-statistics/), 6.5 million animals enter U.S shelters annually, about 3.2 million of the animals in shelters are cats. Approximately 920,000 shelter animals are euthanized, even though many of these animals are healthy enough to be adopted.
+Overcrowding of animal shelters is a major problem across the nation. [According to ASPCA](https://www.aspca.org/helping-people-pets/shelter-intake-and-surrender/pet-statistics/), 6.5 million animals enter U.S shelters annually, and about 3.2 million of the animals in shelters are cats. Approximately 920,000 shelter animals are euthanized, even though many of these animals are healthy enough to be adopted.
 
 In the hopes of assisting animal shelters towards finding shelter cats a happy home, we will delve into a data set of over 29000 shelter cats provided by the Austin Animal Center in Texas. The aim is to create a classifier that can predict if a cat will be adopted based on its characteristics. These classifiers may also offer insight into what characteristics play a significant role in adoption of a cat.
 
